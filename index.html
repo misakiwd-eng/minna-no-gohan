@@ -99,7 +99,7 @@ function doPost(e) {
 
         replyToLine(
           event.replyToken,
-          `🍚 ${displayName}さんが、ごはん仲間に加わったよ！\nこれから一緒に、おいしいごはんを記録していきましょう！`
+          `🍚 ${displayName}さんが、ごはん仲間に加わったよ！\nこれから一緒においしいごはんを記録していこう！`
         );
       }
 
@@ -202,7 +202,7 @@ function doPost(e) {
           if (sameDate) {
             replyToLine(
               event.replyToken,
-              `⚠️ ${dateText}の${mealName[text]}は、すでに記録されています。`
+              `⚠️食べすぎ注意！ ${dateText}の${mealName[text]}は、すでに記録されるよ！`
             );
 
             return textResponse('OK');
