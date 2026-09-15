@@ -1,1084 +1,406 @@
-/**************************************************
- * みんなのごはん
- * Google Apps Script（GAS）バックエンド
- *
- * 役割
- * - LINE Messaging API のWebhook
- * - LINE Login / LIFF のIDトークン検証
- * - GitHub PagesからのJSONP API
- * - Google Sheetsの食事ログ読み書き
- *
- * LINE Login Channel ID:
- * 2011612030
- **************************************************/
-
-const LINE_LOGIN_CHANNEL_ID = '2011612030';
-const TIMEZONE = 'Asia/Tokyo';
-const CACHE_SECONDS = 300; // 5分
-const CACHE_PREFIX = 'gohan:';
-
-
-/**************************************************
- * LINE Webhook
- **************************************************/
-function doPost(e) {
-  const data = JSON.parse(e.postData.contents);
-  const event = data.events[0];
-
-  if (event.type === 'message' && event.message.type === 'text') {
-    const text = event.message.text;
-    const userId = event.source.userId;
-
-    const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
-
-    // ========================================
-    // 初回登録
-    // 「はい！」または「はい」で登録
-    // ========================================
-    if (text === 'はい！' || text === 'はい') {
-      const memberSheet = spreadsheet.getSheetByName('メンバー');
-
-      if (!memberSheet) {
-        throw new Error('メンバーシートが見つかりません。');
-      }
-
-      const token = getChannelAccessToken();
-
-      const profileResponse = UrlFetchApp.fetch(
-        'https://api.line.me/v2/bot/profile/' + encodeURIComponent(userId),
-        {
-          method: 'get',
-          headers: {
-            'Authorization': 'Bearer ' + token
-          },
-          muteHttpExceptions: true
-        }
-      );
-
-      if (profileResponse.getResponseCode() !== 200) {
-        throw new Error(
-          'LINEプロフィールの取得に失敗しました。status=' +
-          profileResponse.getResponseCode()
-        );
-      }
-
-      const profile = JSON.parse(profileResponse.getContentText());
-      const displayName = profile.displayName;
-
-      // すでに登録されているか確認
-      const lastRow = memberSheet.getLastRow();
-      let existingRow = -1;
-
-      if (lastRow >= 2) {
-        const members = memberSheet
-          .getRange(2, 1, lastRow - 1, 3)
-          .getValues();
-
-        for (let i = 0; i < members.length; i++) {
-          if (members[i][0] === userId) {
-            existingRow = i + 2;
-            break;
-          }
-        }
-      }
-
-      if (existingRow !== -1) {
-        memberSheet.getRange(existingRow, 2).setValue(displayName);
-        memberSheet.getRange(existingRow, 3).setValue(true);
-
-        replyToLine(
-          event.replyToken,
-          `🍚 ${displayName}さんは、もうごはん仲間だよ！`
-        );
-      } else {
-        memberSheet.appendRow([
-          userId,
-          displayName,
-          true
-        ]);
-
-        replyToLine(
-          event.replyToken,
-          `🍚 ${displayName}さんが、ごはん仲間に加わったよ！\nこれから一緒においしいごはんを記録していこう！`
-        );
-      }
-
-      return textResponse('OK');
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>みんなのごはん</title>
+  <script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
+  <style>
+    :root {
+      --bg: #fffaf0;
+      --card: #ffffff;
+      --text: #333333;
+      --muted: #777777;
+      --line: #e6e2d8;
+      --accent: #f3d36b;
+      --accent-dark: #d8ae35;
+      --today: #e9b94b;
+      --danger: #c85c52;
     }
-
-    // ========================================
-    // 今月のふりかえり
-    // 「今月の記録」で今月の集計をLINEに返信
-    // ========================================
-    if (text === '今月の記録' || text === '今月のふりかえり') {
-      const summary = getMonthlySummaryForLineUser(userId);
-
-      replyToLine(
-        event.replyToken,
-        summary.message
-      );
-
-      return textResponse('OK');
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; min-height: 100%; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      padding: max(14px, env(safe-area-inset-top)) 12px max(18px, env(safe-area-inset-bottom));
+      -webkit-tap-highlight-color: transparent;
     }
-
-    // 朝・昼・夜以外は何もしない
-    if (!['朝', '昼', '夜'].includes(text)) {
-      return textResponse('OK');
+    button { font: inherit; }
+    .app { width: 100%; max-width: 720px; margin: 0 auto; }
+    .topbar {
+      display: flex; align-items: center; justify-content: space-between;
+      margin: 4px 2px 12px;
     }
-
-    const sheet = spreadsheet.getSheetByName('食事ログ');
-
-    if (!sheet) {
-      throw new Error('食事ログシートが見つかりません。');
+    .title { font-size: 22px; font-weight: 700; }
+    .status { font-size: 12px; color: var(--muted); text-align: right; }
+    .month-nav {
+      display: grid; grid-template-columns: 44px 1fr 44px; gap: 8px;
+      align-items: center; margin-bottom: 10px;
     }
-
-    // LINEの表示名を取得
-    const token = getChannelAccessToken();
-
-    const response = UrlFetchApp.fetch(
-      'https://api.line.me/v2/bot/profile/' + encodeURIComponent(userId),
-      {
-        method: 'get',
-        headers: {
-          'Authorization': 'Bearer ' + token
-        }
-      }
-    );
-
-    const profile = JSON.parse(response.getContentText());
-    const displayName = profile.displayName;
-
-    // 現在日時
-    const now = new Date();
-
-    // 食事日を決める
-    const mealDate = new Date(now);
-
-    // 夜だけ、0:00〜2:59は前日の夜として扱う
-    if (text === '夜' && now.getHours() < 3) {
-      mealDate.setDate(mealDate.getDate() - 1);
+    .month-title { text-align: center; font-size: 20px; font-weight: 700; }
+    .nav-button {
+      width: 44px; height: 40px; border: 0; border-radius: 12px;
+      background: var(--accent); font-size: 25px; line-height: 1; cursor: pointer;
     }
-
-    mealDate.setHours(0, 0, 0, 0);
-
-    const dateText = Utilities.formatDate(
-      mealDate,
-      TIMEZONE,
-      'M/d'
-    );
-
-    const mealName = {
-      '朝': '朝ごはん',
-      '昼': '昼ごはん',
-      '夜': '夜ごはん'
-    };
-
-    // 二重登録チェック
-    const lastRow = sheet.getLastRow();
-
-    if (lastRow >= 2) {
-      const logs = sheet.getRange(
-        2,
-        1,
-        lastRow - 1,
-        6
-      ).getValues();
-
-      for (let i = 0; i < logs.length; i++) {
-        const loggedDate = logs[i][1];
-        const loggedMeal = logs[i][2];
-        const loggedMember = logs[i][3];
-
-        if (
-          loggedDate instanceof Date &&
-          loggedMeal === text &&
-          loggedMember === displayName
-        ) {
-          const sameDate =
-            loggedDate.getFullYear() === mealDate.getFullYear() &&
-            loggedDate.getMonth() === mealDate.getMonth() &&
-            loggedDate.getDate() === mealDate.getDate();
-
-          if (sameDate) {
-            replyToLine(
-              event.replyToken,
-              `⚠️食べすぎ注意！ ${dateText}の${mealName[text]}は、すでに記録されるよ！`
-            );
-
-            return textResponse('OK');
-          }
-        }
-      }
+    .legend {
+      display: flex; justify-content: center; gap: 16px; flex-wrap: wrap;
+      font-size: 12px; color: #555; margin: 4px 0 10px;
     }
+    .legend span { white-space: nowrap; }
+    .calendar-card {
+      background: var(--card); border-radius: 18px; padding: 8px 7px 12px;
+      box-shadow: 0 2px 12px rgba(0,0,0,.04);
+    }
+    .weekdays, .calendar {
+      display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px;
+    }
+    .weekday {
+      text-align: center; font-size: 11px; font-weight: 700; color: #777;
+      padding: 4px 0 6px;
+    }
+    .day {
+      min-width: 0; min-height: 78px; background: #fff; border: 1px solid #eee;
+      border-radius: 10px; padding: 5px 3px; cursor: pointer;
+      display: flex; flex-direction: column; align-items: center;
+    }
+    .day.empty { background: transparent; border: 0; cursor: default; }
+    .day.today { border: 2px solid var(--today); padding: 4px 2px; }
+    .day.selected { box-shadow: inset 0 0 0 2px #333; }
+    .day-number { font-size: 13px; font-weight: 700; margin-bottom: 4px; }
+    .meal-dots { width: 100%; display: grid; gap: 2px; }
+    .meal-line {
+      display: flex; align-items: center; justify-content: center; gap: 2px;
+      min-height: 17px; font-size: 13px; line-height: 1;
+    }
+    .meal-line.off { opacity: .18; filter: grayscale(1); }
+    .meal-name { display: none; }
+    .loading {
+      text-align: center; color: var(--muted); font-size: 14px; padding: 14px 0;
+    }
+    .error {
+      display: none; background: #fff; border: 1px solid #e8c4c0; color: var(--danger);
+      border-radius: 12px; padding: 12px; margin-bottom: 10px; font-size: 13px;
+    }
+    #mealPanel {
+      display: none; background: #fff; border-radius: 18px; padding: 18px;
+      margin-top: 12px; box-shadow: 0 2px 12px rgba(0,0,0,.04);
+    }
+    #selectedDate { text-align: center; font-size: 20px; font-weight: 700; margin-bottom: 16px; }
+    .meal-button {
+      width: 100%; border: 2px solid #ddd; background: #fff; color: #333;
+      border-radius: 12px; padding: 14px; margin-bottom: 9px; font-size: 16px; cursor: pointer;
+    }
+    .meal-button.active { background: var(--accent); border-color: var(--accent-dark); }
+    .update-button {
+      width: 100%; border: 0; background: #333; color: #fff; border-radius: 12px;
+      padding: 14px; margin-top: 4px; font-size: 16px; cursor: pointer;
+    }
+    .update-button:disabled { opacity: .5; cursor: default; }
+    .back-button {
+      width: 100%; border: 0; background: #eee; color: #333; border-radius: 10px;
+      padding: 11px; margin-top: 9px; font-size: 14px; cursor: pointer;
+    }
+    .message { text-align: center; color: var(--muted); font-size: 13px; min-height: 20px; margin-top: 10px; }
+    @media (max-width: 380px) {
+      body { padding-left: 8px; padding-right: 8px; }
+      .calendar-card { padding-left: 4px; padding-right: 4px; }
+      .day { min-height: 72px; }
+      .meal-line { font-size: 12px; }
+    }
+  </style>
+</head>
+<body>
+<div class="app">
+  <div class="topbar">
+    <div class="title">追加・修正</div>
+    <div class="status" id="userStatus">LINEに接続中…</div>
+  </div>
 
-    // 設定シートから金額を取得
-    const price = getMealPrice(text);
+  <div class="error" id="errorBox"></div>
 
-    // 食事ログに記録
-    sheet.appendRow([
-      now,
-      mealDate,
-      text,
-      displayName,
-      price,
-      '当日'
-    ]);
+  <div id="calendarArea">
+    <div class="month-nav">
+      <button class="nav-button" onclick="changeMonth(-1)" aria-label="前の月">‹</button>
+      <div class="month-title" id="monthTitle"></div>
+      <button class="nav-button" onclick="changeMonth(1)" aria-label="次の月">›</button>
+    </div>
 
-    // キャッシュを更新前に無効化
-    invalidateMealCaches(userId, Utilities.formatDate(mealDate, TIMEZONE, 'yyyy-MM-dd'));
+    <div class="legend">
+      <span>🍳 朝</span>
+      <span>☀️ 昼</span>
+      <span>🌙 夜</span>
+      <span>薄い＝未記録</span>
+    </div>
 
-    // 登録成功メッセージ
-    replyToLine(
-      event.replyToken,
-      `🍚 ${dateText}の${mealName[text]}を記録しました！\n¥${price}`
-    );
+    <div class="calendar-card">
+      <div class="weekdays">
+        <div class="weekday">日</div><div class="weekday">月</div><div class="weekday">火</div>
+        <div class="weekday">水</div><div class="weekday">木</div><div class="weekday">金</div><div class="weekday">土</div>
+      </div>
+      <div class="calendar" id="calendar"></div>
+      <div class="loading" id="loading">LINEユーザー情報を確認しています…</div>
+    </div>
+  </div>
+
+  <div id="mealPanel">
+    <div id="selectedDate"></div>
+    <button id="breakfastButton" class="meal-button" onclick="toggleMeal('朝')">朝ごはん</button>
+    <button id="lunchButton" class="meal-button" onclick="toggleMeal('昼')">昼ごはん</button>
+    <button id="dinnerButton" class="meal-button" onclick="toggleMeal('夜')">夜ごはん</button>
+    <button id="updateButton" class="update-button" onclick="saveMealStatus()">更新</button>
+    <button class="back-button" onclick="backToCalendar()">カレンダーに戻る</button>
+    <div class="message" id="message"></div>
+  </div>
+</div>
+
+<script>
+  const LIFF_ID = '2011612030-XhDZ1pKs';
+  const GAS_URL = 'https://script.google.com/macros/s/AKfycbxky7z6Mytj_Z-ZtPqsNZRSRbHbMiAyNibTeTIubLiwHCuprPJP0BHknsX0x_Je2knKsg/exec';
+
+  let currentDate = new Date();
+  let selectedDate = null;
+  let idToken = null;
+  let userId = null;
+  let liffReady = false;
+  let mealStatus = { 朝: false, 昼: false, 夜: false };
+  let monthStatus = {};
+
+  function setError(message) {
+    const box = document.getElementById('errorBox');
+    box.textContent = message;
+    box.style.display = 'block';
   }
 
-  return textResponse('OK');
-}
-
-
-/**************************************************
- * LINEに返信
- **************************************************/
-function replyToLine(replyToken, message) {
-  const token = getChannelAccessToken();
-
-  UrlFetchApp.fetch(
-    'https://api.line.me/v2/bot/message/reply',
-    {
-      method: 'post',
-      contentType: 'application/json',
-      headers: {
-        'Authorization': 'Bearer ' + token
-      },
-      payload: JSON.stringify({
-        replyToken: replyToken,
-        messages: [
-          {
-            type: 'text',
-            text: message
-          }
-        ]
-      })
-    }
-  );
-}
-
-
-/**************************************************
- * GitHub Pages → GAS API
- *
- * API:
- * - monthStatus
- * - mealStatus
- * - updateMealStatus
- *
- * JSONPで返す
- **************************************************/
-function doGet(e) {
-  try {
-    const params = (e && e.parameter) ? e.parameter : {};
-    const api = params.api;
-
-    // API指定がなければ、旧GAS画面を表示
-    if (!api) {
-      return HtmlService
-        .createHtmlOutputFromFile('index')
-        .setTitle('みんなのごはん');
-    }
-
-    let result;
-
-    switch (api) {
-      case 'monthStatus':
-        result = apiMonthStatus(params);
-        break;
-
-      case 'monthlySummary':
-        result = apiMonthlySummary(params);
-        break;
-
-      case 'mealStatus':
-        result = apiMealStatus(params);
-        break;
-
-      case 'updateMealStatus':
-        result = apiUpdateMealStatus(params);
-        break;
-
-      default:
-        throw new Error('不明なAPIです: ' + api);
-    }
-
-    return jsonpResponse(
-      params.callback,
-      result
-    );
-
-  } catch (error) {
-    return jsonpResponse(
-      e && e.parameter ? e.parameter.callback : '',
-      {
-        success: false,
-        error: error.message || String(error)
-      }
-    );
-  }
-}
-
-
-/**************************************************
- * LINE用：今月の食事記録を集計
- **************************************************/
-function getMonthlySummaryForLineUser(userId) {
-  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
-  const memberSheet = spreadsheet.getSheetByName('メンバー');
-  const logSheet = spreadsheet.getSheetByName('食事ログ');
-
-  if (!memberSheet) throw new Error('メンバーシートが見つかりません。');
-  if (!logSheet) throw new Error('食事ログシートが見つかりません。');
-
-  const displayName = getDisplayNameByUserId(userId);
-  const month = Utilities.formatDate(new Date(), TIMEZONE, 'yyyy-MM');
-  const monthLabel = Utilities.formatDate(new Date(), TIMEZONE, 'M月');
-
-  const counts = { 朝: 0, 昼: 0, 夜: 0 };
-  let total = 0;
-  let amount = 0;
-
-  const lastRow = logSheet.getLastRow();
-  if (lastRow >= 2) {
-    const logs = logSheet.getRange(2, 1, lastRow - 1, 6).getValues();
-
-    for (let i = 0; i < logs.length; i++) {
-      const mealDate = logs[i][1];
-      const meal = logs[i][2];
-      const memberName = logs[i][3];
-      const price = Number(logs[i][4]) || 0;
-
-      if (!(mealDate instanceof Date)) continue;
-      if (memberName !== displayName) continue;
-      if (!Object.prototype.hasOwnProperty.call(counts, meal)) continue;
-
-      const key = Utilities.formatDate(mealDate, TIMEZONE, 'yyyy-MM');
-      if (key !== month) continue;
-
-      counts[meal]++;
-      total++;
-      amount += price;
-    }
+  function clearError() {
+    const box = document.getElementById('errorBox');
+    box.textContent = '';
+    box.style.display = 'none';
   }
 
-  const message =
-    '📊 ' + monthLabel + 'の記録\n\n' +
-    '🍳 朝ごはん　' + counts.朝 + '食　¥' + counts.朝 * getMealPrice('朝') + '\n' +
-    '☀️ 昼ごはん　' + counts.昼 + '食　¥' + counts.昼 * getMealPrice('昼') + '\n' +
-    '🌙 夜ごはん　' + counts.夜 + '食　¥' + counts.夜 * getMealPrice('夜') + '\n\n' +
-    '合計　' + total + '食　¥' + amount;
-
-  return {
-    displayName: displayName,
-    month: month,
-    total: total,
-    amount: amount,
-    counts: counts,
-    message: message
-  };
-}
-
-
-/**************************************************
- * LINEユーザーIDから表示名を取得
- **************************************************/
-function getDisplayNameByUserId(userId) {
-  const memberSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('メンバー');
-  const lastRow = memberSheet.getLastRow();
-
-  if (lastRow >= 2) {
-    const members = memberSheet.getRange(2, 1, lastRow - 1, 3).getValues();
-    for (let i = 0; i < members.length; i++) {
-      if (members[i][0] === userId) {
-        return members[i][1];
-      }
-    }
+  function formatDate(date) {
+    const y = date.getFullYear();
+    const m = String(date.getMonth() + 1).padStart(2, '0');
+    const d = String(date.getDate()).padStart(2, '0');
+    return `${y}-${m}-${d}`;
   }
 
-  // メンバーにまだ名前がない場合はLINEプロフィールから取得
-  const token = getChannelAccessToken();
-  const response = UrlFetchApp.fetch(
-    'https://api.line.me/v2/bot/profile/' + encodeURIComponent(userId),
-    {
-      method: 'get',
-      headers: { 'Authorization': 'Bearer ' + token },
-      muteHttpExceptions: true
-    }
-  );
-
-  if (response.getResponseCode() !== 200) {
-    throw new Error('LINEプロフィールの取得に失敗しました。');
+  function monthKey(date) {
+    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
   }
 
-  return JSON.parse(response.getContentText()).displayName;
-}
-
-
-/**************************************************
- * 月の食事記録
- **************************************************/
-function apiMonthlySummary(params) {
-  requireCallback(params.callback);
-
-  const month = params.month;
-  const idToken = params.idToken;
-
-  validateMonth(month);
-  requireValue(idToken, 'idToken');
-
-  const user = verifyIdToken(idToken);
-  const displayName = getDisplayNameFromVerifiedUser(user);
-
-  const counts = { 朝: 0, 昼: 0, 夜: 0 };
-  let total = 0;
-  let amount = 0;
-
-  const sheet = SpreadsheetApp
-    .getActiveSpreadsheet()
-    .getSheetByName('食事ログ');
-
-  if (!sheet) {
-    throw new Error('食事ログシートが見つかりません。');
+  function jsonp(api, params) {
+    return new Promise((resolve, reject) => {
+      const callbackName = 'gohanCallback_' + Date.now() + '_' + Math.random().toString(36).slice(2);
+      const script = document.createElement('script');
+      const query = new URLSearchParams({ api, callback: callbackName, ...params });
+      let finished = false;
+      const cleanup = () => {
+        try { delete window[callbackName]; } catch (e) { window[callbackName] = undefined; }
+        if (script.parentNode) script.parentNode.removeChild(script);
+      };
+      const timer = setTimeout(() => {
+        if (finished) return;
+        finished = true;
+        cleanup();
+        reject(new Error('サーバーからの応答がありません。'));
+      }, 20000);
+      window[callbackName] = (data) => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timer);
+        cleanup();
+        if (data && data.success === false) reject(new Error(data.error || 'サーバーエラー'));
+        else resolve(data);
+      };
+      script.onerror = () => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timer);
+        cleanup();
+        reject(new Error('GASとの通信に失敗しました。'));
+      };
+      script.src = GAS_URL + '?' + query.toString();
+      document.body.appendChild(script);
+    });
   }
 
-  const lastRow = sheet.getLastRow();
-
-  if (lastRow >= 2) {
-    const logs = sheet.getRange(2, 1, lastRow - 1, 6).getValues();
-
-    for (let i = 0; i < logs.length; i++) {
-      const loggedDate = logs[i][1];
-      const meal = logs[i][2];
-      const memberName = logs[i][3];
-      const price = Number(logs[i][4]) || 0;
-
-      if (!(loggedDate instanceof Date)) continue;
-      if (memberName !== displayName) continue;
-      if (!Object.prototype.hasOwnProperty.call(counts, meal)) continue;
-
-      const key = Utilities.formatDate(loggedDate, TIMEZONE, 'yyyy-MM');
-      if (key !== month) continue;
-
-      counts[meal]++;
-      total++;
-      amount += price;
-    }
-  }
-
-  ensureMember(user.sub, displayName);
-
-  return {
-    success: true,
-    month: month,
-    displayName: displayName,
-    total: total,
-    amount: amount,
-    counts: counts
-  };
-}
-
-
-function apiMonthStatus(params) {
-  requireCallback(params.callback);
-
-  const month = params.month;
-  const idToken = params.idToken;
-
-  validateMonth(month);
-  requireValue(idToken, 'idToken');
-
-  const user = verifyIdToken(idToken);
-  const displayName = getDisplayNameFromVerifiedUser(user);
-  const cache = CacheService.getScriptCache();
-  const cacheKey = CACHE_PREFIX + 'month:' + user.sub + ':' + month;
-  const cached = cache.get(cacheKey);
-
-  if (cached) {
-    return JSON.parse(cached);
-  }
-
-  const days = createEmptyMonthStatus(month);
-  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('食事ログ');
-
-  if (!sheet) throw new Error('食事ログシートが見つかりません。');
-
-  const lastRow = sheet.getLastRow();
-  if (lastRow >= 2) {
-    const logs = sheet.getRange(2, 1, lastRow - 1, 6).getValues();
-
-    for (let i = 0; i < logs.length; i++) {
-      const loggedDate = logs[i][1];
-      const meal = logs[i][2];
-      const memberName = logs[i][3];
-
-      if (!(loggedDate instanceof Date)) continue;
-      if (memberName !== displayName) continue;
-      if (!['朝', '昼', '夜'].includes(meal)) continue;
-
-      const key = Utilities.formatDate(loggedDate, TIMEZONE, 'yyyy-MM-dd');
-      if (key.slice(0, 7) !== month) continue;
-      if (days[key]) days[key][meal] = true;
-    }
-  }
-
-  const result = { success: true, days: days };
-  cache.put(cacheKey, JSON.stringify(result), CACHE_SECONDS);
-  return result;
-}
-
-/**************************************************
- * 指定日の食事記録
- **************************************************/
-function apiMealStatus(params) {
-  requireCallback(params.callback);
-
-  const dateText = params.date;
-  const idToken = params.idToken;
-
-  validateDate(dateText);
-  requireValue(idToken, 'idToken');
-
-  const user = verifyIdToken(idToken);
-  const displayName = getDisplayNameFromVerifiedUser(user);
-  const cache = CacheService.getScriptCache();
-  const cacheKey = CACHE_PREFIX + 'date:' + user.sub + ':' + dateText;
-  const cached = cache.get(cacheKey);
-
-  if (cached) return JSON.parse(cached);
-
-  const status = { 朝: false, 昼: false, 夜: false };
-  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('食事ログ');
-
-  if (!sheet) throw new Error('食事ログシートが見つかりません。');
-
-  const lastRow = sheet.getLastRow();
-  if (lastRow >= 2) {
-    const logs = sheet.getRange(2, 1, lastRow - 1, 6).getValues();
-
-    for (let i = 0; i < logs.length; i++) {
-      const loggedDate = logs[i][1];
-      const meal = logs[i][2];
-      const memberName = logs[i][3];
-
-      if (!(loggedDate instanceof Date)) continue;
-      if (memberName !== displayName) continue;
-      if (!Object.prototype.hasOwnProperty.call(status, meal)) continue;
-
-      const key = Utilities.formatDate(loggedDate, TIMEZONE, 'yyyy-MM-dd');
-      if (key === dateText) status[meal] = true;
-    }
-  }
-
-  const result = { success: true, status: status };
-  cache.put(cacheKey, JSON.stringify(result), CACHE_SECONDS);
-  return result;
-}
-
-/**************************************************
- * 指定日の食事記録を更新
- *
- * ON → 追加
- * OFF → 削除
- *
- * 「更新」を押した時だけ実行
- **************************************************/
-function apiUpdateMealStatus(params) {
-  requireCallback(params.callback);
-
-  const dateText = params.date;
-  const idToken = params.idToken;
-
-  validateDate(dateText);
-  requireValue(idToken, 'idToken');
-
-  const user = verifyIdToken(idToken);
-  const displayName = getDisplayNameFromVerifiedUser(user);
-
-  const newStatus = {
-    朝: params.breakfast === '1',
-    昼: params.lunch === '1',
-    夜: params.dinner === '1'
-  };
-
-  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = spreadsheet.getSheetByName('食事ログ');
-
-  if (!sheet) {
-    throw new Error('食事ログシートが見つかりません。');
-  }
-
-  ensureMember(user.sub, displayName);
-
-  // 現在のログを取得
-  let logs = [];
-
-  const lastRow = sheet.getLastRow();
-
-  if (lastRow >= 2) {
-    logs = sheet.getRange(
-      2,
-      1,
-      lastRow - 1,
-      6
-    ).getValues();
-  }
-
-  // 現在登録されている食事
-  const existingMeals = {
-    朝: false,
-    昼: false,
-    夜: false
-  };
-
-  for (let i = 0; i < logs.length; i++) {
-    const loggedDate = logs[i][1];
-    const meal = logs[i][2];
-    const memberName = logs[i][3];
-
-    if (!(loggedDate instanceof Date)) {
-      continue;
-    }
-
-    const key = Utilities.formatDate(
-      loggedDate,
-      TIMEZONE,
-      'yyyy-MM-dd'
-    );
-
-    if (
-      key === dateText &&
-      memberName === displayName &&
-      Object.prototype.hasOwnProperty.call(existingMeals, meal)
-    ) {
-      existingMeals[meal] = true;
-    }
-  }
-
-  // OFFになった食事を削除
-  // 下の行から削除して行番号のズレを防ぐ
-  for (let i = logs.length - 1; i >= 0; i--) {
-    const loggedDate = logs[i][1];
-    const meal = logs[i][2];
-    const memberName = logs[i][3];
-
-    if (!(loggedDate instanceof Date)) {
-      continue;
-    }
-
-    const key = Utilities.formatDate(
-      loggedDate,
-      TIMEZONE,
-      'yyyy-MM-dd'
-    );
-
-    if (
-      key === dateText &&
-      memberName === displayName &&
-      Object.prototype.hasOwnProperty.call(newStatus, meal) &&
-      newStatus[meal] === false
-    ) {
-      // logs[0] = シート2行目
-      sheet.deleteRow(i + 2);
-    }
-  }
-
-  // ONになった食事を追加
-  const targetDate = dateFromYmd(dateText);
-
-  for (const meal of ['朝', '昼', '夜']) {
-    if (
-      newStatus[meal] === true &&
-      existingMeals[meal] === false
-    ) {
-      sheet.appendRow([
-        new Date(),
-        targetDate,
-        meal,
-        displayName,
-        getMealPrice(meal),
-        'カレンダー'
-      ]);
-    }
-  }
-
-  invalidateMealCaches(user.sub, dateText);
-
-  return {
-    success: true,
-    status: newStatus
-  };
-}
-
-
-/**************************************************
- * LINE IDトークン検証
- *
- * LINE公式の
- * POST /oauth2/v2.1/verify
- * を使用する。
- *
- * チャネルシークレットはここでは不要。
- **************************************************/
-function verifyIdToken(idToken) {
-  requireValue(idToken, 'idToken');
-
-  const response = UrlFetchApp.fetch(
-    'https://api.line.me/oauth2/v2.1/verify',
-    {
-      method: 'post',
-      contentType: 'application/x-www-form-urlencoded',
-      payload: {
-        id_token: idToken,
-        client_id: LINE_LOGIN_CHANNEL_ID
-      },
-      muteHttpExceptions: true
-    }
-  );
-
-  const status = response.getResponseCode();
-  const body = response.getContentText();
-
-  if (status !== 200) {
-    let detail = '';
-
+  async function initializeLIFF() {
     try {
-      const errorBody = JSON.parse(body);
-      detail = errorBody.error_description || errorBody.error || '';
-    } catch (e) {
-      detail = body;
-    }
+      document.getElementById('userStatus').textContent = 'LINEに接続中…';
+      await liff.init({ liffId: LIFF_ID, withLoginOnExternalBrowser: true });
 
-    throw new Error(
-      'LINE IDトークンの検証に失敗しました。' +
-      (detail ? ' ' + detail : '')
-    );
-  }
-
-  const result = JSON.parse(body);
-
-  if (result.iss !== 'https://access.line.me') {
-    throw new Error('LINE IDトークンの発行元が正しくありません。');
-  }
-
-  if (String(result.aud) !== String(LINE_LOGIN_CHANNEL_ID)) {
-    throw new Error('LINE IDトークンのチャネルIDが一致しません。');
-  }
-
-  if (!result.sub) {
-    throw new Error('LINEユーザーIDを取得できませんでした。');
-  }
-
-  if (result.exp && Number(result.exp) <= Math.floor(Date.now() / 1000)) {
-    throw new Error('LINE IDトークンの有効期限が切れています。');
-  }
-
-  return result;
-}
-
-
-/**************************************************
- * 検証済みLINEユーザーから表示名を取得
- *
- * IDトークンの name があれば使用。
- * なければBot APIでプロフィールを取得。
- **************************************************/
-function getDisplayNameFromVerifiedUser(user) {
-  if (user.name) {
-    return user.name;
-  }
-
-  const token = getChannelAccessToken();
-
-  const response = UrlFetchApp.fetch(
-    'https://api.line.me/v2/bot/profile/' +
-      encodeURIComponent(user.sub),
-    {
-      method: 'get',
-      headers: {
-        'Authorization': 'Bearer ' + token
-      },
-      muteHttpExceptions: true
-    }
-  );
-
-  if (response.getResponseCode() !== 200) {
-    throw new Error(
-      'LINEプロフィールの取得に失敗しました。status=' +
-      response.getResponseCode()
-    );
-  }
-
-  const profile = JSON.parse(
-    response.getContentText()
-  );
-
-  if (!profile.displayName) {
-    throw new Error('LINE表示名を取得できませんでした。');
-  }
-
-  return profile.displayName;
-}
-
-
-/**************************************************
- * メンバーシートを更新
- **************************************************/
-function ensureMember(userId, displayName) {
-  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
-  const memberSheet = spreadsheet.getSheetByName('メンバー');
-
-  if (!memberSheet) {
-    return;
-  }
-
-  const lastRow = memberSheet.getLastRow();
-
-  if (lastRow >= 2) {
-    const members = memberSheet
-      .getRange(2, 1, lastRow - 1, 3)
-      .getValues();
-
-    for (let i = 0; i < members.length; i++) {
-      if (members[i][0] === userId) {
-        const row = i + 2;
-
-        if (members[i][1] !== displayName) {
-          memberSheet.getRange(row, 2).setValue(displayName);
-        }
-
-        if (members[i][2] !== true) {
-          memberSheet.getRange(row, 3).setValue(true);
-        }
-
+      if (!liff.isLoggedIn()) {
+        liff.login();
         return;
       }
+
+      idToken = liff.getIDToken();
+      if (!idToken) throw new Error('LINEの認証情報を取得できませんでした。');
+
+      liffReady = true;
+      document.getElementById('userStatus').textContent = 'LINE接続済み';
+      document.getElementById('loading').textContent = '記録を読み込んでいます…';
+      clearError();
+
+      await loadMonthStatus();
+    } catch (error) {
+      liffReady = false;
+      document.getElementById('loading').style.display = 'none';
+      setError('LINEとの接続に失敗しました。\n' + (error.message || error));
     }
   }
 
-  memberSheet.appendRow([
-    userId,
-    displayName,
-    true
-  ]);
-}
-
-
-/**************************************************
- * 月初から月末までの空ステータスを作成
- **************************************************/
-function createEmptyMonthStatus(month) {
-  const parts = month.split('-');
-  const year = Number(parts[0]);
-  const monthNumber = Number(parts[1]);
-
-  const daysInMonth = new Date(
-    year,
-    monthNumber,
-    0
-  ).getDate();
-
-  const days = {};
-
-  for (let day = 1; day <= daysInMonth; day++) {
-    const date = new Date(
-      year,
-      monthNumber - 1,
-      day
-    );
-
-    const key = Utilities.formatDate(
-      date,
-      TIMEZONE,
-      'yyyy-MM-dd'
-    );
-
-    days[key] = {
-      朝: false,
-      昼: false,
-      夜: false
-    };
-  }
-
-  return days;
-}
-
-
-/**************************************************
- * 設定シートから料金取得
- **************************************************/
-function getMealPrice(meal) {
-  const cache = CacheService.getScriptCache();
-  const cacheKey = CACHE_PREFIX + 'price:' + meal;
-  const cached = cache.get(cacheKey);
-  if (cached !== null) return Number(cached);
-
-  const sheet = SpreadsheetApp
-    .getActiveSpreadsheet()
-    .getSheetByName('設定');
-
-  if (!sheet) {
-    throw new Error('設定シートが見つかりません。');
-  }
-
-  const settings = sheet.getDataRange().getValues();
-
-  for (let i = 1; i < settings.length; i++) {
-    if (settings[i][0] === meal) {
-      const price = Number(settings[i][1]);
-
-      if (!isNaN(price)) {
-        cache.put(cacheKey, String(price), CACHE_SECONDS);
-        return price;
-      }
+  async function loadMonthStatus() {
+    if (!liffReady || !idToken) return;
+    const key = monthKey(currentDate);
+    document.getElementById('loading').style.display = 'block';
+    try {
+      const result = await jsonp('monthStatus', { month: key, idToken });
+      monthStatus = result.days || {};
+      renderCalendar();
+    } catch (error) {
+      setError('今月の記録を読み込めませんでした。\n' + error.message);
+    } finally {
+      document.getElementById('loading').style.display = 'none';
     }
   }
 
-  throw new Error(
-    '設定シートに「' + meal + '」の料金がありません。'
-  );
-}
+  function renderCalendar() {
+    const year = currentDate.getFullYear();
+    const month = currentDate.getMonth();
+    document.getElementById('monthTitle').textContent = `${year}年${month + 1}月`;
 
+    const calendar = document.getElementById('calendar');
+    calendar.innerHTML = '';
+    const firstDay = new Date(year, month, 1).getDay();
+    const daysInMonth = new Date(year, month + 1, 0).getDate();
+    const today = new Date();
 
-/**************************************************
- * キャッシュ無効化
- **************************************************/
-function invalidateMealCaches(userId, dateText) {
-  const cache = CacheService.getScriptCache();
-  const month = dateText.slice(0, 7);
-  cache.remove(CACHE_PREFIX + 'month:' + userId + ':' + month);
-  cache.remove(CACHE_PREFIX + 'date:' + userId + ':' + dateText);
-}
+    for (let i = 0; i < firstDay; i++) {
+      const empty = document.createElement('div');
+      empty.className = 'day empty';
+      calendar.appendChild(empty);
+    }
 
+    for (let day = 1; day <= daysInMonth; day++) {
+      const cell = document.createElement('div');
+      cell.className = 'day';
+      const date = new Date(year, month, day);
+      const key = formatDate(date);
+      const status = monthStatus[key] || { 朝: false, 昼: false, 夜: false };
 
-/**************************************************
- * 日付処理
- **************************************************/
-function dateFromYmd(dateText) {
-  const parts = dateText.split('-');
+      if (year === today.getFullYear() && month === today.getMonth() && day === today.getDate()) cell.classList.add('today');
 
-  return new Date(
-    Number(parts[0]),
-    Number(parts[1]) - 1,
-    Number(parts[2]),
-    0,
-    0,
-    0,
-    0
-  );
-}
+      const number = document.createElement('div');
+      number.className = 'day-number';
+      number.textContent = day;
+      cell.appendChild(number);
 
-function validateDate(dateText) {
-  if (
-    !dateText ||
-    !/^\d{4}-\d{2}-\d{2}$/.test(dateText)
-  ) {
-    throw new Error('日付の形式が正しくありません。');
+      const dots = document.createElement('div');
+      dots.className = 'meal-dots';
+      [
+        ['朝', '🍳'],
+        ['昼', '☀️'],
+        ['夜', '🌙']
+      ].forEach(([meal, icon]) => {
+        const line = document.createElement('div');
+        line.className = 'meal-line' + (status[meal] ? '' : ' off');
+        line.textContent = icon;
+        dots.appendChild(line);
+      });
+      cell.appendChild(dots);
+      cell.onclick = () => selectDate(year, month, day);
+      calendar.appendChild(cell);
+    }
   }
 
-  const date = dateFromYmd(dateText);
+  async function selectDate(year, month, day) {
+    selectedDate = new Date(year, month, day);
+    document.getElementById('calendarArea').style.display = 'none';
+    document.getElementById('mealPanel').style.display = 'block';
+    document.getElementById('selectedDate').textContent = `${month + 1}月${day}日の記録`;
+    document.getElementById('message').textContent = '読み込み中…';
+    mealStatus = { 朝: false, 昼: false, 夜: false };
+    updateMealButtons();
 
-  if (
-    isNaN(date.getTime()) ||
-    Utilities.formatDate(date, TIMEZONE, 'yyyy-MM-dd') !== dateText
-  ) {
-    throw new Error('存在しない日付です。');
-  }
-}
-
-function validateMonth(month) {
-  if (
-    !month ||
-    !/^\d{4}-\d{2}$/.test(month)
-  ) {
-    throw new Error('月の形式が正しくありません。');
-  }
-
-  const year = Number(month.slice(0, 4));
-  const monthNumber = Number(month.slice(5, 7));
-
-  if (
-    year < 2000 ||
-    year > 2100 ||
-    monthNumber < 1 ||
-    monthNumber > 12
-  ) {
-    throw new Error('月の指定が正しくありません。');
-  }
-}
-
-
-/**************************************************
- * JSONPレスポンス
- **************************************************/
-function jsonpResponse(callback, data) {
-  requireCallback(callback);
-
-  const safeCallback =
-    String(callback).trim();
-
-  const json = JSON.stringify(data)
-    .replace(/</g, '\\u003c')
-    .replace(/>/g, '\\u003e')
-    .replace(/&/g, '\\u0026');
-
-  const javascript =
-    safeCallback + '(' + json + ');';
-
-  return ContentService
-    .createTextOutput(javascript)
-    .setMimeType(
-      ContentService.MimeType.JAVASCRIPT
-    );
-}
-
-function requireCallback(callback) {
-  if (
-    !callback ||
-    !/^[A-Za-z_$][0-9A-Za-z_$]*$/.test(String(callback))
-  ) {
-    throw new Error('callbackが正しくありません。');
-  }
-}
-
-
-/**************************************************
- * 共通ヘルパー
- **************************************************/
-function requireValue(value, name) {
-  if (
-    value === undefined ||
-    value === null ||
-    String(value).trim() === ''
-  ) {
-    throw new Error(name + 'がありません。');
-  }
-}
-
-function getChannelAccessToken() {
-  const token = PropertiesService
-    .getScriptProperties()
-    .getProperty('CHANNEL_ACCESS_TOKEN');
-
-  if (!token) {
-    throw new Error(
-      'CHANNEL_ACCESS_TOKENが設定されていません。'
-    );
+    try {
+      const result = await jsonp('mealStatus', { date: formatDate(selectedDate), idToken });
+      mealStatus = {
+        朝: result.status && result.status.朝 === true,
+        昼: result.status && result.status.昼 === true,
+        夜: result.status && result.status.夜 === true
+      };
+      updateMealButtons();
+      document.getElementById('message').textContent = '';
+    } catch (error) {
+      document.getElementById('message').textContent = '';
+      setError('記録の読み込みに失敗しました。\n' + error.message);
+    }
   }
 
-  return token;
-}
+  function toggleMeal(meal) {
+    if (!liffReady || !idToken) {
+      setError('LINEユーザー情報を取得中です。');
+      return;
+    }
+    mealStatus[meal] = !mealStatus[meal];
+    updateMealButtons();
+    document.getElementById('message').textContent = '変更内容は「更新」を押すと反映されます。';
+  }
 
-function textResponse(text) {
-  return ContentService
-    .createTextOutput(text)
-    .setMimeType(ContentService.MimeType.TEXT);
-}
+  function updateMealButtons() {
+    document.getElementById('breakfastButton').classList.toggle('active', mealStatus.朝 === true);
+    document.getElementById('lunchButton').classList.toggle('active', mealStatus.昼 === true);
+    document.getElementById('dinnerButton').classList.toggle('active', mealStatus.夜 === true);
+  }
+
+  async function saveMealStatus() {
+    if (!liffReady || !idToken || !selectedDate) {
+      setError('LINEユーザー情報を取得中です。');
+      return;
+    }
+    const button = document.getElementById('updateButton');
+    button.disabled = true;
+    button.textContent = '更新中…';
+    clearError();
+
+    try {
+      await jsonp('updateMealStatus', {
+        date: formatDate(selectedDate),
+        idToken,
+        breakfast: mealStatus.朝 ? '1' : '0',
+        lunch: mealStatus.昼 ? '1' : '0',
+        dinner: mealStatus.夜 ? '1' : '0'
+      });
+      document.getElementById('message').textContent = '更新しました。';
+      const key = formatDate(selectedDate);
+      monthStatus[key] = { ...mealStatus };
+      renderCalendar();
+    } catch (error) {
+      setError('更新に失敗しました。\n' + error.message);
+    } finally {
+      button.disabled = false;
+      button.textContent = '更新';
+    }
+  }
+
+  function backToCalendar() {
+    document.getElementById('mealPanel').style.display = 'none';
+    document.getElementById('calendarArea').style.display = 'block';
+    clearError();
+    renderCalendar();
+  }
+
+  async function changeMonth(direction) {
+    currentDate.setMonth(currentDate.getMonth() + direction);
+    monthStatus = {};
+    renderCalendar();
+    if (liffReady) await loadMonthStatus();
+  }
+
+  renderCalendar();
+  initializeLIFF();
+</script>
+</body>
+</html>
