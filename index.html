@@ -204,7 +204,7 @@
         finished = true;
         cleanup();
         reject(new Error('サーバーからの応答がありません。'));
-      }, 15000);
+      }, 20000);
       window[callbackName] = (data) => {
         if (finished) return;
         finished = true;
@@ -227,83 +227,27 @@
 
   async function initializeLIFF() {
     try {
-      document.getElementById('userStatus').textContent = 'LINE接続を診断中…';
+      document.getElementById('userStatus').textContent = 'LINEに接続中…';
+      await liff.init({ liffId: LIFF_ID, withLoginOnExternalBrowser: true });
 
-      await liff.init({
-        liffId: LIFF_ID,
-        withLoginOnExternalBrowser: true
-      });
-
-      const context = liff.getContext ? liff.getContext() : null;
-      const granted = liff.permission && liff.permission.getGrantedAll
-        ? await liff.permission.getGrantedAll()
-        : null;
-
-      const loggedIn = liff.isLoggedIn();
-      const inClient = liff.isInClient();
-
-      if (!loggedIn) {
-        document.getElementById('loading').style.display = 'none';
-        setError(
-          '【診断】LIFF初期化は成功しましたが、LINEログイン状態ではありません。\n' +
-          'isLoggedIn=' + loggedIn + '\n' +
-          'isInClient=' + inClient + '\n' +
-          'scope=' + JSON.stringify(context ? context.scope : null) + '\n' +
-          'granted=' + JSON.stringify(granted)
-        );
+      if (!liff.isLoggedIn()) {
         liff.login();
         return;
       }
 
       idToken = liff.getIDToken();
-      const decoded = liff.getDecodedIDToken
-        ? liff.getDecodedIDToken()
-        : null;
-      const accessToken = liff.getAccessToken
-        ? liff.getAccessToken()
-        : null;
+      if (!idToken) throw new Error('LINEの認証情報を取得できませんでした。');
 
-      if (!idToken) {
-        document.getElementById('loading').style.display = 'none';
-
-        setError(
-          '【診断】LINEログイン後ですが、IDトークンを取得できませんでした。\n\n' +
-          'isLoggedIn=' + loggedIn + '\n' +
-          'isInClient=' + inClient + '\n' +
-          'scope=' + JSON.stringify(context ? context.scope : null) + '\n' +
-          'granted=' + JSON.stringify(granted) + '\n' +
-          'accessToken=' + (accessToken ? 'あり' : 'なし') + '\n' +
-          'decodedIDToken=' + (decoded ? 'あり' : 'なし') + '\n\n' +
-          '※トークン本体は表示していません。'
-        );
-        return;
-      }
-
-      const profile = await liff.getProfile();
-      userId = profile.userId;
       liffReady = true;
-
-      document.getElementById('userStatus').textContent =
-        profile.displayName || 'LINE接続済み';
-
-      document.getElementById('loading').textContent =
-        '記録を読み込んでいます…';
-
+      document.getElementById('userStatus').textContent = 'LINE接続済み';
+      document.getElementById('loading').textContent = '記録を読み込んでいます…';
       clearError();
 
       await loadMonthStatus();
-
     } catch (error) {
       liffReady = false;
       document.getElementById('loading').style.display = 'none';
-
-      setError(
-        '【診断】LINEとの接続中にエラーが発生しました。\n\n' +
-        'message=' + (error.message || error) + '\n' +
-        'name=' + (error.name || '') + '\n' +
-        'isLoggedIn=' + (typeof liff !== 'undefined' && liff.isLoggedIn ? liff.isLoggedIn() : '取得不可') + '\n' +
-        'isInClient=' + (typeof liff !== 'undefined' && liff.isInClient ? liff.isInClient() : '取得不可')
-      );
+      setError('LINEとの接続に失敗しました。\n' + (error.message || error));
     }
   }
 
