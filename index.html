@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>みんなのごはん</title>
+  <script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
+  <style>
+    :root {
+      --bg: #fffaf0;
+      --card: #ffffff;
+      --text: #333333;
+      --muted: #777777;
+      --line: #e6e2d8;
+      --accent: #f3d36b;
+      --accent-dark: #d8ae35;
+      --today: #e9b94b;
+      --danger: #c85c52;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; min-height: 100%; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      padding: max(14px, env(safe-area-inset-top)) 12px max(18px, env(safe-area-inset-bottom));
+      -webkit-tap-highlight-color: transparent;
+    }
+    button { font: inherit; }
+    .app { width: 100%; max-width: 720px; margin: 0 auto; }
+    .topbar {
+      display: flex; align-items: center; justify-content: space-between;
+      margin: 4px 2px 12px;
+    }
+    .title { font-size: 22px; font-weight: 700; }
+    .status { font-size: 12px; color: var(--muted); text-align: right; }
+    .month-nav {
+      display: grid; grid-template-columns: 44px 1fr 44px; gap: 8px;
+      align-items: center; margin-bottom: 10px;
+    }
+    .month-title { text-align: center; font-size: 20px; font-weight: 700; }
+    .nav-button {
+      width: 44px; height: 40px; border: 0; border-radius: 12px;
+      background: var(--accent); font-size: 25px; line-height: 1; cursor: pointer;
+    }
+    .legend {
+      display: flex; justify-content: center; gap: 16px; flex-wrap: wrap;
+      font-size: 12px; color: #555; margin: 4px 0 10px;
+    }
+    .legend span { white-space: nowrap; }
+    .calendar-card {
+      background: var(--card); border-radius: 18px; padding: 8px 7px 12px;
+      box-shadow: 0 2px 12px rgba(0,0,0,.04);
+    }
+    .weekdays, .calendar {
+      display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px;
+    }
+    .weekday {
+      text-align: center; font-size: 11px; font-weight: 700; color: #777;
+      padding: 4px 0 6px;
+    }
+    .day {
+      min-width: 0; min-height: 78px; background: #fff; border: 1px solid #eee;
+      border-radius: 10px; padding: 5px 3px; cursor: pointer;
+      display: flex; flex-direction: column; align-items: center;
+    }
+    .day.empty { background: transparent; border: 0; cursor: default; }
+    .day.today { border: 2px solid var(--today); padding: 4px 2px; }
+    .day.selected { box-shadow: inset 0 0 0 2px #333; }
+    .day-number { font-size: 13px; font-weight: 700; margin-bottom: 4px; }
+    .meal-dots { width: 100%; display: grid; gap: 2px; }
+    .meal-line {
+      display: flex; align-items: center; justify-content: center; gap: 2px;
+      min-height: 17px; font-size: 13px; line-height: 1;
+    }
+    .meal-line.off { opacity: .18; filter: grayscale(1); }
+    .meal-name { display: none; }
+    .loading {
+      text-align: center; color: var(--muted); font-size: 14px; padding: 14px 0;
+    }
+    .error {
+      display: none; background: #fff; border: 1px solid #e8c4c0; color: var(--danger);
+      border-radius: 12px; padding: 12px; margin-bottom: 10px; font-size: 13px;
+    }
+    #mealPanel {
+      display: none; background: #fff; border-radius: 18px; padding: 18px;
+      margin-top: 12px; box-shadow: 0 2px 12px rgba(0,0,0,.04);
+    }
+    #selectedDate { text-align: center; font-size: 20px; font-weight: 700; margin-bottom: 16px; }
+    .meal-button {
+      width: 100%; border: 2px solid #ddd; background: #fff; color: #333;
+      border-radius: 12px; padding: 14px; margin-bottom: 9px; font-size: 16px; cursor: pointer;
+    }
+    .meal-button.active { background: var(--accent); border-color: var(--accent-dark); }
+    .update-button {
+      width: 100%; border: 0; background: #333; color: #fff; border-radius: 12px;
+      padding: 14px; margin-top: 4px; font-size: 16px; cursor: pointer;
+    }
+    .update-button:disabled { opacity: .5; cursor: default; }
+    .back-button {
+      width: 100%; border: 0; background: #eee; color: #333; border-radius: 10px;
+      padding: 11px; margin-top: 9px; font-size: 14px; cursor: pointer;
+    }
+    .message { text-align: center; color: var(--muted); font-size: 13px; min-height: 20px; margin-top: 10px; }
+    @media (max-width: 380px) {
+      body { padding-left: 8px; padding-right: 8px; }
+      .calendar-card { padding-left: 4px; padding-right: 4px; }
+      .day { min-height: 72px; }
+      .meal-line { font-size: 12px; }
+    }
+  </style>
+</head>
+<body>
+<div class="app">
+  <div class="topbar">
+    <div class="title">追加・修正</div>
+    <div class="status" id="userStatus">LINEに接続中…</div>
+  </div>
+
+  <div class="error" id="errorBox"></div>
+
+  <div id="calendarArea">
+    <div class="month-nav">
+      <button class="nav-button" onclick="changeMonth(-1)" aria-label="前の月">‹</button>
+      <div class="month-title" id="monthTitle"></div>
+      <button class="nav-button" onclick="changeMonth(1)" aria-label="次の月">›</button>
+    </div>
+
+    <div class="legend">
+      <span>🍳 朝</span>
+      <span>☀️ 昼</span>
+      <span>🌙 夜</span>
+      <span>薄い＝未記録</span>
+    </div>
+
+    <div class="calendar-card">
+      <div class="weekdays">
+        <div class="weekday">日</div><div class="weekday">月</div><div class="weekday">火</div>
+        <div class="weekday">水</div><div class="weekday">木</div><div class="weekday">金</div><div class="weekday">土</div>
+      </div>
+      <div class="calendar" id="calendar"></div>
+      <div class="loading" id="loading">LINEユーザー情報を確認しています…</div>
+    </div>
+  </div>
+
+  <div id="mealPanel">
+    <div id="selectedDate"></div>
+    <button id="breakfastButton" class="meal-button" onclick="toggleMeal('朝')">朝ごはん</button>
+    <button id="lunchButton" class="meal-button" onclick="toggleMeal('昼')">昼ごはん</button>
+    <button id="dinnerButton" class="meal-button" onclick="toggleMeal('夜')">夜ごはん</button>
+    <button id="updateButton" class="update-button" onclick="saveMealStatus()">更新</button>
+    <button class="back-button" onclick="backToCalendar()">カレンダーに戻る</button>
+    <div class="message" id="message"></div>
+  </div>
+</div>
+
+<script>
+  const LIFF_ID = '2011612030-XhDZ1pKs';
+  const GAS_URL = 'https://script.google.com/macros/s/AKfycbxky7z6Mytj_Z-ZtPqsNZRSRbHbMiAyNibTeTIubLiwHCuprPJP0BHknsX0x_Je2knKsg/exec';
+
+  let currentDate = new Date();
+  let selectedDate = null;
+  let idToken = null;
+  let userId = null;
+  let liffReady = false;
+  let mealStatus = { 朝: false, 昼: false, 夜: false };
+  let monthStatus = {};
+
+  function setError(message) {
+    const box = document.getElementById('errorBox');
+    box.textContent = message;
+    box.style.display = 'block';
+  }
+
+  function clearError() {
+    const box = document.getElementById('errorBox');
+    box.textContent = '';
+    box.style.display = 'none';
+  }
+
+  function formatDate(date) {
+    const y = date.getFullYear();
+    const m = String(date.getMonth() + 1).padStart(2, '0');
+    const d = String(date.getDate()).padStart(2, '0');
+    return `${y}-${m}-${d}`;
+  }
+
+  function monthKey(date) {
+    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+  }
+
+  function jsonp(api, params) {
+    return new Promise((resolve, reject) => {
+      const callbackName = 'gohanCallback_' + Date.now() + '_' + Math.random().toString(36).slice(2);
+      const script = document.createElement('script');
+      const query = new URLSearchParams({ api, callback: callbackName, ...params });
+      let finished = false;
+      const cleanup = () => {
+        try { delete window[callbackName]; } catch (e) { window[callbackName] = undefined; }
+        if (script.parentNode) script.parentNode.removeChild(script);
+      };
+      const timer = setTimeout(() => {
+        if (finished) return;
+        finished = true;
+        cleanup();
+        reject(new Error('サーバーからの応答がありません。'));
+      }, 15000);
+      window[callbackName] = (data) => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timer);
+        cleanup();
+        if (data && data.success === false) reject(new Error(data.error || 'サーバーエラー'));
+        else resolve(data);
+      };
+      script.onerror = () => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timer);
+        cleanup();
+        reject(new Error('GASとの通信に失敗しました。'));
+      };
+      script.src = GAS_URL + '?' + query.toString();
+      document.body.appendChild(script);
+    });
+  }
+
+  async function initializeLIFF() {
+    try {
+      document.getElementById('userStatus').textContent = 'LINEに接続中…';
+      await liff.init({ liffId: LIFF_ID, withLoginOnExternalBrowser: true });
+
+      if (!liff.isLoggedIn()) {
+        liff.login();
+        return;
+      }
+
+      idToken = liff.getIDToken();
+      if (!idToken) throw new Error('LINEの認証情報を取得できませんでした。');
+
+      const profile = await liff.getProfile();
+      userId = profile.userId;
+      liffReady = true;
+      document.getElementById('userStatus').textContent = profile.displayName || 'LINE接続済み';
+      document.getElementById('loading').textContent = '記録を読み込んでいます…';
+      clearError();
+
+      await loadMonthStatus();
+    } catch (error) {
+      liffReady = false;
+      document.getElementById('loading').style.display = 'none';
+      setError('LINEとの接続に失敗しました。\n' + (error.message || error));
+    }
+  }
+
+  async function loadMonthStatus() {
+    if (!liffReady || !idToken) return;
+    const key = monthKey(currentDate);
+    document.getElementById('loading').style.display = 'block';
+    try {
+      const result = await jsonp('monthStatus', { month: key, idToken });
+      monthStatus = result.days || {};
+      renderCalendar();
+    } catch (error) {
+      setError('今月の記録を読み込めませんでした。\n' + error.message);
+    } finally {
+      document.getElementById('loading').style.display = 'none';
+    }
+  }
+
+  function renderCalendar() {
+    const year = currentDate.getFullYear();
+    const month = currentDate.getMonth();
+    document.getElementById('monthTitle').textContent = `${year}年${month + 1}月`;
+
+    const calendar = document.getElementById('calendar');
+    calendar.innerHTML = '';
+    const firstDay = new Date(year, month, 1).getDay();
+    const daysInMonth = new Date(year, month + 1, 0).getDate();
+    const today = new Date();
+
+    for (let i = 0; i < firstDay; i++) {
+      const empty = document.createElement('div');
+      empty.className = 'day empty';
+      calendar.appendChild(empty);
+    }
+
+    for (let day = 1; day <= daysInMonth; day++) {
+      const cell = document.createElement('div');
+      cell.className = 'day';
+      const date = new Date(year, month, day);
+      const key = formatDate(date);
+      const status = monthStatus[key] || { 朝: false, 昼: false, 夜: false };
+
+      if (year === today.getFullYear() && month === today.getMonth() && day === today.getDate()) cell.classList.add('today');
+
+      const number = document.createElement('div');
+      number.className = 'day-number';
+      number.textContent = day;
+      cell.appendChild(number);
+
+      const dots = document.createElement('div');
+      dots.className = 'meal-dots';
+      [
+        ['朝', '🍳'],
+        ['昼', '☀️'],
+        ['夜', '🌙']
+      ].forEach(([meal, icon]) => {
+        const line = document.createElement('div');
+        line.className = 'meal-line' + (status[meal] ? '' : ' off');
+        line.textContent = icon;
+        dots.appendChild(line);
+      });
+      cell.appendChild(dots);
+      cell.onclick = () => selectDate(year, month, day);
+      calendar.appendChild(cell);
+    }
+  }
+
+  async function selectDate(year, month, day) {
+    selectedDate = new Date(year, month, day);
+    document.getElementById('calendarArea').style.display = 'none';
+    document.getElementById('mealPanel').style.display = 'block';
+    document.getElementById('selectedDate').textContent = `${month + 1}月${day}日の記録`;
+    document.getElementById('message').textContent = '読み込み中…';
+    mealStatus = { 朝: false, 昼: false, 夜: false };
+    updateMealButtons();
+
+    try {
+      const result = await jsonp('mealStatus', { date: formatDate(selectedDate), idToken });
+      mealStatus = {
+        朝: result.status && result.status.朝 === true,
+        昼: result.status && result.status.昼 === true,
+        夜: result.status && result.status.夜 === true
+      };
+      updateMealButtons();
+      document.getElementById('message').textContent = '';
+    } catch (error) {
+      document.getElementById('message').textContent = '';
+      setError('記録の読み込みに失敗しました。\n' + error.message);
+    }
+  }
+
+  function toggleMeal(meal) {
+    if (!liffReady || !idToken) {
+      setError('LINEユーザー情報を取得中です。');
+      return;
+    }
+    mealStatus[meal] = !mealStatus[meal];
+    updateMealButtons();
+    document.getElementById('message').textContent = '変更内容は「更新」を押すと反映されます。';
+  }
+
+  function updateMealButtons() {
+    document.getElementById('breakfastButton').classList.toggle('active', mealStatus.朝 === true);
+    document.getElementById('lunchButton').classList.toggle('active', mealStatus.昼 === true);
+    document.getElementById('dinnerButton').classList.toggle('active', mealStatus.夜 === true);
+  }
+
+  async function saveMealStatus() {
+    if (!liffReady || !idToken || !selectedDate) {
+      setError('LINEユーザー情報を取得中です。');
+      return;
+    }
+    const button = document.getElementById('updateButton');
+    button.disabled = true;
+    button.textContent = '更新中…';
+    clearError();
+
+    try {
+      await jsonp('updateMealStatus', {
+        date: formatDate(selectedDate),
+        idToken,
+        breakfast: mealStatus.朝 ? '1' : '0',
+        lunch: mealStatus.昼 ? '1' : '0',
+        dinner: mealStatus.夜 ? '1' : '0'
+      });
+      document.getElementById('message').textContent = '更新しました。';
+      const key = formatDate(selectedDate);
+      monthStatus[key] = { ...mealStatus };
+      renderCalendar();
+    } catch (error) {
+      setError('更新に失敗しました。\n' + error.message);
+    } finally {
+      button.disabled = false;
+      button.textContent = '更新';
+    }
+  }
+
+  function backToCalendar() {
+    document.getElementById('mealPanel').style.display = 'none';
+    document.getElementById('calendarArea').style.display = 'block';
+    clearError();
+    renderCalendar();
+  }
+
+  async function changeMonth(direction) {
+    currentDate.setMonth(currentDate.getMonth() + direction);
+    monthStatus = {};
+    renderCalendar();
+    if (liffReady) await loadMonthStatus();
+  }
+
+  renderCalendar();
+  initializeLIFF();
+</script>
+</body>
+</html>
